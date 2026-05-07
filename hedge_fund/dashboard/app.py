@@ -1,22 +1,23 @@
 """
 CEO Dashboard — Streamlit Interface
 
-Provides the Founder/CEO with:
-  - Directive input to the CIO
-  - Morning memo display
-  - Live portfolio state and P&L
-  - Risk metrics and alerts
-  - Trade approval/veto workflow
-  - Full audit log viewer
+Pages:
+  Activity Monitor  — live feed of what every agent is doing right now
+  Morning Memo      — CIO's daily market view and trade ideas
+  Issue Directive   — send a directive to the CIO and watch it propagate
+  Portfolio         — open positions, blotter, sector breakdown
+  Risk              — CRO risk metrics and hard-limit status
+  Trade Approvals   — approve or veto pending large trades
+  Audit Log         — full immutable message history
+  Run Cycle         — manual cycle control and individual reports
 
 Run with: streamlit run hedge_fund/dashboard/app.py
 """
 
 from __future__ import annotations
 
-import json
 import sys
-import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,7 +27,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import streamlit as st
 import pandas as pd
 
-from hedge_fund.messaging.bus import init_bus, get_audit_log
+from hedge_fund.messaging.bus import (
+    init_bus, get_audit_log, get_activity_feed,
+    all_queue_depths, total_pending_messages,
+)
 from hedge_fund.memory.shared_state import (
     init_portfolio_db, get_positions, get_nav, get_cash,
     compute_risk_metrics, get_blotter, get_recommendations,
@@ -43,11 +47,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Event type styling ────────────────────────────────────────────────────────
+EVENT_ICON = {
+    "thinking":   "🧠",
+    "responded":  "✅",
+    "sent":       "📤",
+    "received":   "📥",
+    "tool_call":  "🔧",
+    "task_start": "🎯",
+    "error":      "❌",
+}
+EVENT_COLOR = {
+    "thinking":   "#d0e8ff",
+    "responded":  "#d4edda",
+    "sent":       "#fff3cd",
+    "received":   "#e2e3e5",
+    "tool_call":  "#f8d7da",
+    "task_start": "#cfe2ff",
+    "error":      "#f8d7da",
+}
 
-# ── Init Databases ────────────────────────────────────────────────────────────
+
+# ── Init Databases (once per session) ─────────────────────────────────────────
 @st.cache_resource
 def get_orchestrator():
-    """Load the orchestrator once per session."""
     init_bus()
     init_portfolio_db()
     from hedge_fund.scheduler import HedgeFundOrchestrator
@@ -61,8 +84,12 @@ def fmt_usd(v: float) -> str:
 def fmt_pct(v: float) -> str:
     return f"{v:.2%}"
 
-def color_pnl(v: float) -> str:
-    return "green" if v >= 0 else "red"
+def ts_short(ts_str: str) -> str:
+    """Format ISO timestamp to HH:MM:SS."""
+    try:
+        return datetime.fromisoformat(ts_str).strftime("%H:%M:%S")
+    except Exception:
+        return ts_str[-8:] if len(ts_str) >= 8 else ts_str
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -71,18 +98,20 @@ with st.sidebar:
     st.caption("CEO Dashboard")
     st.divider()
 
-    # Nav metrics in sidebar
     try:
         nav = get_nav()
         cash = get_cash()
         metrics = compute_risk_metrics()
         halted = is_halted()
+        pending = total_pending_messages()
 
         st.metric("NAV", fmt_usd(nav))
         st.metric("Cash", fmt_usd(cash))
         st.metric("Drawdown", fmt_pct(metrics["current_drawdown_pct"]))
+        st.metric("Pending messages", pending,
+                  help="Unread messages waiting in agent inboxes. Run 'Flush & Drain' to process.")
         if halted:
-            st.error("TRADING HALT ACTIVE")
+            st.error("⚠️ TRADING HALT ACTIVE")
     except Exception as e:
         st.warning(f"DB not ready: {e}")
 
@@ -90,6 +119,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         [
+            "Activity Monitor",
             "Morning Memo",
             "Issue Directive",
             "Portfolio",
@@ -107,7 +137,140 @@ orch = get_orchestrator()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-if page == "Morning Memo":
+if page == "Activity Monitor":
+    st.header("Activity Monitor")
+    st.caption(
+        "Live feed of what every agent is doing. Each row is one logged event: "
+        "thinking (LLM call started), responded (LLM call finished), "
+        "sent/received (messages), tool_call (external tool use), error."
+    )
+
+    # ── Controls row ─────────────────────────────────────────────────────────
+    col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 2])
+    with col_a:
+        agent_filter = st.selectbox(
+            "Agent",
+            ["All agents"] + sorted(orch._agents.keys()),
+        )
+    with col_b:
+        event_filter = st.multiselect(
+            "Event types",
+            options=["thinking", "responded", "sent", "received", "tool_call", "task_start", "error"],
+            default=[],
+            placeholder="All types",
+        )
+    with col_c:
+        limit = st.number_input("Max rows", min_value=20, max_value=500, value=80)
+    with col_d:
+        auto_refresh = st.toggle("Auto-refresh every 5s", value=False)
+
+    st.divider()
+
+    # ── Queue depth snapshot ──────────────────────────────────────────────────
+    st.markdown("**Current inbox queue depths** (messages waiting to be processed)")
+    try:
+        depths = all_queue_depths()
+        if depths:
+            depth_df = pd.DataFrame(
+                [{"Agent": k, "Pending messages": v} for k, v in sorted(depths.items())]
+            )
+            st.dataframe(depth_df, use_container_width=True, hide_index=True)
+        else:
+            st.success("All agent inboxes are empty — no pending messages.")
+    except Exception as e:
+        st.error(f"Could not load queue depths: {e}")
+
+    # ── Flush control ─────────────────────────────────────────────────────────
+    st.markdown("**Process pending messages**")
+    f1, f2 = st.columns(2)
+    with f1:
+        if st.button("⚡ Flush & Drain (process until empty)", type="primary"):
+            progress_placeholder = st.empty()
+            log_lines = []
+
+            def show_progress(round_num, detail):
+                active = detail.get("active_agents", {})
+                if active:
+                    agents_str = ", ".join(
+                        f"{a}({n})" for a, n in active.items()
+                    )
+                    log_lines.append(
+                        f"Round {round_num}: {detail['responses_sent']} responses "
+                        f"from [{agents_str}] — {detail['pending_after']} still pending"
+                    )
+                    progress_placeholder.text("\n".join(log_lines[-8:]))
+
+            with st.spinner("Draining message bus..."):
+                result = orch.drain_messages(max_rounds=10, callback=show_progress)
+
+            if result["queues_empty"]:
+                st.success(
+                    f"Done — {result['total_processed']} responses across "
+                    f"{result['rounds']} rounds. All queues empty."
+                )
+            else:
+                st.warning(
+                    f"Stopped after {result['rounds']} rounds. "
+                    f"{total_pending_messages()} messages still pending — run again."
+                )
+            st.rerun()
+
+    with f2:
+        if st.button("Single flush (1 round)"):
+            n = orch.flush_messages(rounds=1)
+            st.info(f"1-round flush: {n} responses sent.")
+            st.rerun()
+
+    st.divider()
+
+    # ── Activity feed ─────────────────────────────────────────────────────────
+    st.markdown("**Agent activity log** (most recent first)")
+    try:
+        feed = get_activity_feed(
+            limit=int(limit),
+            agent_id=None if agent_filter == "All agents" else agent_filter,
+            event_types=event_filter if event_filter else None,
+        )
+        if feed:
+            rows = []
+            for entry in feed:
+                et = entry.get("event_type", "")
+                icon = EVENT_ICON.get(et, "•")
+                rows.append({
+                    "Time": ts_short(entry.get("timestamp", "")),
+                    "Agent": entry.get("agent_id", ""),
+                    "Event": f"{icon} {et}",
+                    "Details": entry.get("details", ""),
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Time": st.column_config.TextColumn(width="small"),
+                    "Agent": st.column_config.TextColumn(width="medium"),
+                    "Event": st.column_config.TextColumn(width="small"),
+                    "Details": st.column_config.TextColumn(width="large"),
+                },
+            )
+            st.caption(f"Showing {len(feed)} events.")
+        else:
+            st.info(
+                "No activity yet. Issue a directive on the 'Issue Directive' page, "
+                "then click 'Flush & Drain' above to watch agents process it."
+            )
+    except Exception as e:
+        st.error(f"Could not load activity feed: {e}")
+
+    # ── Auto-refresh ──────────────────────────────────────────────────────────
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+elif page == "Morning Memo":
     st.header("CIO Morning Memo")
 
     if st.button("Refresh Memo", type="primary"):
@@ -154,7 +317,11 @@ if page == "Morning Memo":
 # ════════════════════════════════════════════════════════════════════════════════
 elif page == "Issue Directive":
     st.header("Issue Directive to CIO")
-    st.caption("Your directive will be decomposed and dispatched to the relevant Portfolio Managers.")
+    st.caption(
+        "Type a directive in natural language. The CIO will decompose it into "
+        "PM tasks and dispatch research. Use **Flush & Drain** after sending to "
+        "propagate the work through the full org hierarchy."
+    )
 
     directive = st.text_area(
         "Directive",
@@ -174,21 +341,60 @@ elif page == "Issue Directive":
         with st.spinner("CIO processing directive..."):
             try:
                 result = orch.ceo_directive(directive.strip(), priority=priority)
-                st.success("Directive dispatched.")
-                st.markdown(f"**CIO Response:**\n\n{result}")
-
-                # Auto-flush messages
-                with st.spinner("Propagating messages through org..."):
-                    flushed = orch.flush_messages(rounds=2)
-                st.info(f"{flushed} messages processed through the org.")
+                st.success("Directive dispatched to CIO.")
+                st.markdown(f"**CIO decomposition:**\n\n{result}")
             except Exception as e:
                 st.error(f"Error: {e}")
+                st.stop()
+
+        # Drain the bus — show live progress
+        st.markdown("---")
+        st.markdown("**Propagating through org hierarchy...**")
+        st.caption(
+            "Messages are being passed: CIO → PMs → Analysts → PMs → Compliance → CRO. "
+            "Each round is one hop. This makes real Claude API calls so it takes a moment per agent."
+        )
+        progress_box = st.empty()
+        log_lines: list[str] = []
+
+        def update_progress(round_num, detail):
+            active = detail.get("active_agents", {})
+            if active:
+                agents_str = ", ".join(
+                    f"{a} ({n} msg)" for a, n in active.items()
+                )
+                log_lines.append(f"  Round {round_num}: {agents_str}")
+            else:
+                log_lines.append(f"  Round {round_num}: (no new responses)")
+            pending = detail.get("pending_after", 0)
+            display = "\n".join(log_lines[-6:])
+            display += f"\n  → {pending} messages still pending"
+            progress_box.code(display)
+
+        with st.spinner("Draining..."):
+            drain_result = orch.drain_messages(max_rounds=10, callback=update_progress)
+
+        if drain_result["queues_empty"]:
+            st.success(
+                f"All done. {drain_result['total_processed']} agent responses across "
+                f"{drain_result['rounds']} rounds. All queues are empty."
+            )
+        else:
+            remaining = total_pending_messages()
+            st.warning(
+                f"Completed {drain_result['rounds']} rounds "
+                f"({drain_result['total_processed']} responses). "
+                f"{remaining} messages still pending — click 'Flush & Drain' on "
+                f"the Activity Monitor page to continue."
+            )
+
+        st.info("Check the **Activity Monitor** page to see what every agent did.")
 
     st.divider()
     st.markdown("#### CEO Inbox (messages addressed to you)")
     try:
         from hedge_fund.messaging.bus import receive
-        ceo_msgs = receive("ceo", limit=20)
+        ceo_msgs = receive("ceo", limit=20, mark_read=False)
         if ceo_msgs:
             for msg in ceo_msgs:
                 with st.expander(
@@ -198,7 +404,7 @@ elif page == "Issue Directive":
                     st.caption(f"Received: {msg.timestamp.strftime('%Y-%m-%d %H:%M UTC')}")
                     st.write(msg.body)
         else:
-            st.info("No new messages.")
+            st.info("No messages for the CEO yet.")
     except Exception as e:
         st.warning(f"Could not load inbox: {e}")
 
@@ -207,7 +413,6 @@ elif page == "Issue Directive":
 elif page == "Portfolio":
     st.header("Portfolio State")
 
-    # Metrics row
     try:
         metrics = compute_risk_metrics()
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -238,10 +443,12 @@ elif page == "Portfolio":
                     "Pod": p.pod or "—",
                     "Sector": p.sector or "—",
                 })
-            df = pd.DataFrame(pos_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
         else:
-            st.info("No open positions.")
+            st.info(
+                "No open positions. Issue a directive and drain the message bus — "
+                "trade recommendations will appear in 'Trade Approvals' once the pipeline runs."
+            )
     except Exception as e:
         st.error(f"Could not load positions: {e}")
 
@@ -252,7 +459,7 @@ elif page == "Portfolio":
         if blotter:
             st.dataframe(pd.DataFrame(blotter), use_container_width=True, hide_index=True)
         else:
-            st.info("No trades recorded yet.")
+            st.info("No trades executed yet.")
     except Exception as e:
         st.error(f"Could not load blotter: {e}")
 
@@ -261,12 +468,13 @@ elif page == "Portfolio":
     try:
         metrics = compute_risk_metrics()
         sector_df = pd.DataFrame(
-            [{"Sector": k, "% NAV": fmt_pct(v)} for k, v in metrics["sector_breakdown"].items()]
+            [{"Sector": k, "% NAV": fmt_pct(v)}
+             for k, v in metrics["sector_breakdown"].items()]
         )
         if not sector_df.empty:
             st.dataframe(sector_df, use_container_width=True, hide_index=True)
         else:
-            st.info("No sector data.")
+            st.info("No sector data — no open positions.")
     except Exception as e:
         st.error(f"Sector breakdown error: {e}")
 
@@ -285,14 +493,12 @@ elif page == "Risk":
 
     report = st.session_state.get("risk_report")
     if report:
-        halted = report.halt_triggered
-        if halted:
+        if report.halt_triggered:
             st.error("⚠️ TRADING HALT ACTIVE — Drawdown limit breached")
 
         col1, col2, col3 = st.columns(3)
         col1.metric("NAV", fmt_usd(report.nav))
-        col2.metric("Current Drawdown", fmt_pct(report.current_drawdown_pct),
-                    delta_color="inverse")
+        col2.metric("Current Drawdown", fmt_pct(report.current_drawdown_pct))
         col3.metric("VaR 95% (1d)", fmt_usd(report.var_95_1day))
 
         col4, col5, col6 = st.columns(3)
@@ -304,14 +510,16 @@ elif page == "Risk":
         st.subheader("Pod P&L")
         if report.pod_pnl:
             pod_df = pd.DataFrame(
-                [{"Pod": k, "Unrealised P&L": fmt_usd(v)} for k, v in report.pod_pnl.items()]
+                [{"Pod": k, "Unrealised P&L": fmt_usd(v)}
+                 for k, v in report.pod_pnl.items()]
             )
             st.dataframe(pod_df, use_container_width=True, hide_index=True)
 
         st.subheader("Sector Exposure")
         if report.sector_breakdown:
             sec_df = pd.DataFrame(
-                [{"Sector": k, "% NAV": fmt_pct(v)} for k, v in report.sector_breakdown.items()]
+                [{"Sector": k, "% NAV": fmt_pct(v)}
+                 for k, v in report.sector_breakdown.items()]
             )
             st.dataframe(sec_df, use_container_width=True, hide_index=True)
     else:
@@ -322,7 +530,8 @@ elif page == "Risk":
     limits = {
         "Max Position Size": "5% of NAV",
         "Max Sector Concentration": "20% of NAV",
-        "Max Portfolio Drawdown": "15% (triggers halt)",
+        "Max Portfolio Drawdown": "15% — triggers trading halt",
+        "Max Gross Leverage": "200% of NAV",
         "Large Trade Approval": "$50,000 notional → CIO approval required",
     }
     for k, v in limits.items():
@@ -332,55 +541,58 @@ elif page == "Risk":
 # ════════════════════════════════════════════════════════════════════════════════
 elif page == "Trade Approvals":
     st.header("Trade Approval Queue")
-    st.caption("Review and approve/veto trade recommendations pending CEO action.")
+    st.caption(
+        "Trades that have cleared Compliance and the CRO are shown here. "
+        "Large trades (> $50k notional) land in PENDING_CIO and need your explicit approval."
+    )
 
     try:
-        # Show all recent recommendations grouped by status
         for status in ["pending_cio", "approved", "rejected", "executed"]:
             recs = get_recommendations(status=status)
-            if recs:
-                st.subheader(f"{status.replace('_', ' ').upper()} ({len(recs)})")
-                for rec in recs[:10]:
-                    with st.expander(
-                        f"{rec['direction'].upper()} {rec['ticker']} — "
-                        f"${rec['target_notional_usd']:,.0f} | "
-                        f"Confidence: {rec['confidence_score']:.2f}",
-                        expanded=(status == "pending_cio"),
-                    ):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"**PM:** {rec['pm_id']}")
-                            st.write(f"**Size:** {rec['target_pct_nav']:.1%} of NAV")
-                            st.write(f"**Expected Return:** {rec['expected_return_pct']:.1%}")
-                            st.write(f"**Stop Loss:** {rec['stop_loss_pct']:.1%}")
-                            st.write(f"**Take Profit:** {rec['take_profit_pct']:.1%}")
-                            st.write(f"**Horizon:** {rec['time_horizon_days']} days")
-                        with col2:
-                            st.write(f"**Rationale:** {rec['rationale'][:300]}")
-                            st.write(f"**Status:** {rec['status']}")
-                            st.write(f"**Submitted:** {rec['timestamp']}")
+            if not recs:
+                continue
+            st.subheader(f"{status.replace('_', ' ').upper()} ({len(recs)})")
+            for rec in recs[:10]:
+                with st.expander(
+                    f"{rec['direction'].upper()} {rec['ticker']} — "
+                    f"${rec['target_notional_usd']:,.0f} | "
+                    f"Confidence: {rec['confidence_score']:.2f}",
+                    expanded=(status == "pending_cio"),
+                ):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**PM:** {rec['pm_id']}")
+                        st.write(f"**Size:** {rec['target_pct_nav']:.1%} of NAV")
+                        st.write(f"**Expected Return:** {rec['expected_return_pct']:.1%}")
+                        st.write(f"**Stop Loss:** {rec['stop_loss_pct']:.1%}")
+                        st.write(f"**Take Profit:** {rec['take_profit_pct']:.1%}")
+                        st.write(f"**Horizon:** {rec['time_horizon_days']} days")
+                    with col2:
+                        st.write(f"**Rationale:** {rec['rationale'][:300]}")
+                        st.write(f"**Status:** {rec['status']}")
+                        st.write(f"**Submitted:** {rec['timestamp']}")
 
-                        if status == "pending_cio":
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                if st.button(f"✅ Approve", key=f"approve_{rec['rec_id']}"):
-                                    from hedge_fund.memory.shared_state import update_recommendation_status
-                                    update_recommendation_status(rec['rec_id'], "approved")
-                                    st.success("Trade approved.")
-                                    st.rerun()
-                            with c2:
-                                if st.button(f"❌ Veto", key=f"veto_{rec['rec_id']}"):
-                                    from hedge_fund.memory.shared_state import update_recommendation_status
-                                    update_recommendation_status(rec['rec_id'], "rejected")
-                                    st.error("Trade vetoed.")
-                                    st.rerun()
+                    if status == "pending_cio":
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button(f"✅ Approve", key=f"approve_{rec['rec_id']}"):
+                                from hedge_fund.memory.shared_state import update_recommendation_status
+                                update_recommendation_status(rec['rec_id'], "approved")
+                                st.success("Trade approved.")
+                                st.rerun()
+                        with c2:
+                            if st.button(f"❌ Veto", key=f"veto_{rec['rec_id']}"):
+                                from hedge_fund.memory.shared_state import update_recommendation_status
+                                update_recommendation_status(rec['rec_id'], "rejected")
+                                st.error("Trade vetoed.")
+                                st.rerun()
 
-        if not any(
-            get_recommendations(status=s)
-            for s in ["pending_cio", "approved", "rejected", "executed"]
-        ):
-            st.info("No trade recommendations in the system yet.")
-
+        all_recs = get_recommendations()
+        if not all_recs:
+            st.info(
+                "No trade recommendations yet. Issue a directive, drain the message bus, "
+                "and recommendations will appear here once PMs synthesize research."
+            )
     except Exception as e:
         st.error(f"Error loading recommendations: {e}")
 
@@ -388,6 +600,7 @@ elif page == "Trade Approvals":
 # ════════════════════════════════════════════════════════════════════════════════
 elif page == "Audit Log":
     st.header("Agent Communication Audit Log")
+    st.caption("Every message sent between agents — immutable, timestamped.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -405,11 +618,10 @@ elif page == "Audit Log":
         )
         if log:
             df = pd.DataFrame(log)
-            # Truncate long body for display
             if "body" in df.columns:
                 df["body"] = df["body"].str[:150]
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption(f"Showing {len(log)} audit records.")
+            st.caption(f"Showing {len(log)} records.")
         else:
             st.info("No audit records found.")
     except Exception as e:
@@ -419,12 +631,16 @@ elif page == "Audit Log":
 # ════════════════════════════════════════════════════════════════════════════════
 elif page == "Run Cycle":
     st.header("Run Daily Cycle")
-    st.caption("Manually trigger the full daily investment cycle.")
+    st.caption(
+        "Manually trigger the full 8-stage daily investment cycle, or run individual reports. "
+        "The cycle makes many Claude API calls — allow several minutes to complete."
+    )
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Run Full Daily Cycle", type="primary"):
-            with st.spinner("Running daily cycle... (this may take a few minutes)"):
+            progress = st.empty()
+            with st.spinner("Running daily cycle..."):
                 try:
                     results = orch.run_daily_cycle()
                     st.success(f"Cycle complete in {results.get('duration_seconds', 0):.1f}s")
@@ -437,13 +653,27 @@ elif page == "Run Cycle":
                     st.error(f"Cycle error: {e}")
 
     with col2:
-        if st.button("Flush Message Bus"):
-            with st.spinner("Flushing messages..."):
-                try:
-                    n = orch.flush_messages(rounds=3)
-                    st.success(f"Flushed {n} messages.")
-                except Exception as e:
-                    st.error(f"Flush error: {e}")
+        if st.button("Flush & Drain"):
+            log_lines: list[str] = []
+            progress_box = st.empty()
+
+            def cb(round_num, detail):
+                active = detail.get("active_agents", {})
+                line = f"Round {round_num}: " + (
+                    ", ".join(f"{a}({n})" for a, n in active.items())
+                    if active else "(idle)"
+                )
+                log_lines.append(line)
+                progress_box.code("\n".join(log_lines[-8:]))
+
+            with st.spinner("Draining..."):
+                result = orch.drain_messages(max_rounds=10, callback=cb)
+            if result["queues_empty"]:
+                st.success(
+                    f"{result['total_processed']} responses in {result['rounds']} rounds. Done."
+                )
+            else:
+                st.warning(f"Stopped at {result['rounds']} rounds — run again.")
 
     st.divider()
     st.subheader("Individual Reports")
@@ -458,6 +688,7 @@ elif page == "Run Cycle":
                     st.metric("Daily P&L", fmt_usd(report.daily_pnl))
                     st.metric("Daily Return", fmt_pct(report.daily_return_pct))
                     st.metric("Cash", fmt_usd(report.cash_balance))
+                    st.metric("Fee Accrual", fmt_usd(report.fee_accrual))
                 except Exception as e:
                     st.error(str(e))
 
@@ -468,7 +699,7 @@ elif page == "Run Cycle":
                     report = orch.get_risk_report()
                     st.metric("Drawdown", fmt_pct(report.current_drawdown_pct))
                     st.metric("VaR 95%", fmt_usd(report.var_95_1day))
-                    st.metric("Halt", "YES" if report.halt_triggered else "No")
+                    st.metric("Halt", "YES ⚠️" if report.halt_triggered else "No")
                 except Exception as e:
                     st.error(str(e))
 

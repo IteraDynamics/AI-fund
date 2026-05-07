@@ -52,6 +52,19 @@ def init_bus(db_path: str = AUDIT_DB_PATH) -> None:
     """Create tables if they don't exist. Call once at startup."""
     with _get_conn(db_path) as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_activity (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id    TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                details     TEXT NOT NULL,
+                timestamp   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_activity_agent
+                ON agent_activity (agent_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_activity_ts
+                ON agent_activity (timestamp);
+
             CREATE TABLE IF NOT EXISTS messages (
                 message_id   TEXT PRIMARY KEY,
                 sender       TEXT NOT NULL,
@@ -239,5 +252,86 @@ def queue_depth(agent_id: str, db_path: str = AUDIT_DB_PATH) -> int:
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM messages WHERE recipient=? AND read_at IS NULL",
             (agent_id,),
+        ).fetchone()
+    return row["cnt"]
+
+
+def all_queue_depths(db_path: str = AUDIT_DB_PATH) -> dict[str, int]:
+    """Return unread message counts for every agent that has pending messages."""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT recipient, COUNT(*) as cnt FROM messages "
+            "WHERE read_at IS NULL GROUP BY recipient"
+        ).fetchall()
+    return {r["recipient"]: r["cnt"] for r in rows}
+
+
+# ── Activity Log ──────────────────────────────────────────────────────────────
+
+def log_activity(
+    agent_id: str,
+    event_type: str,
+    details: str,
+    db_path: str = AUDIT_DB_PATH,
+) -> None:
+    """
+    Write a single agent activity event to the activity log.
+    event_type examples: 'thinking', 'responded', 'sent', 'received', 'error', 'task_start'
+    Non-blocking — swallows exceptions so it never disrupts agent logic.
+    """
+    ts = datetime.utcnow().isoformat()
+    try:
+        with _lock:
+            with _get_conn(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO agent_activity (agent_id, event_type, details, timestamp) "
+                    "VALUES (?,?,?,?)",
+                    (agent_id, event_type, details[:500], ts),
+                )
+    except Exception:
+        pass  # activity log is best-effort
+
+
+def get_activity_feed(
+    limit: int = 50,
+    agent_id: Optional[str] = None,
+    since: Optional[datetime] = None,
+    event_types: Optional[list[str]] = None,
+    db_path: str = AUDIT_DB_PATH,
+) -> list[dict]:
+    """
+    Return recent activity log entries, newest first.
+    Optionally filter by agent_id, since timestamp, or event_types.
+    """
+    clauses: list[str] = []
+    params: list = []
+
+    if agent_id:
+        clauses.append("agent_id = ?")
+        params.append(agent_id)
+    if since:
+        clauses.append("timestamp >= ?")
+        params.append(since.isoformat())
+    if event_types:
+        placeholders = ",".join("?" * len(event_types))
+        clauses.append(f"event_type IN ({placeholders})")
+        params.extend(event_types)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM agent_activity {where} ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def total_pending_messages(db_path: str = AUDIT_DB_PATH) -> int:
+    """Total unread messages across all agents."""
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM messages WHERE read_at IS NULL"
         ).fetchone()
     return row["cnt"]

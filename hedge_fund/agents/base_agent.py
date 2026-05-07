@@ -3,11 +3,13 @@ BaseAgent: foundation class for every agent in the fund.
 
 Each agent has:
   - A system prompt encoding its role, mandate, and personality
-  - A Claude API client (claude-sonnet-4-20250514)
+  - A Claude API client (claude-sonnet-4-5)
   - A ChromaDB vector memory store
   - A SQLite message-bus inbox/outbox
   - Tool access gated by role
   - Structured output parsing via Pydantic
+  - Activity logging: every LLM call, message sent/received, and error
+    is written to the agent_activity table for live monitoring.
 
 Agents are designed to be called synchronously or scheduled asynchronously.
 """
@@ -27,6 +29,7 @@ from pydantic import BaseModel
 from hedge_fund.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, AUDIT_DB_PATH
 from hedge_fund.memory.vector_store import AgentMemory
 from hedge_fund.messaging import bus as message_bus
+from hedge_fund.messaging.bus import log_activity
 from hedge_fund.models.schemas import AgentMessage, MessagePriority
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,12 @@ class BaseAgent:
         self._last_response_time: float = 0.0
         logger.info(f"[{self.agent_id}] Initialized")
 
+    # ── Activity logging helper ────────────────────────────────────────────────
+
+    def _log(self, event_type: str, details: str) -> None:
+        """Write an activity event. Never raises."""
+        log_activity(self.agent_id, event_type, details, db_path=self.db_path)
+
     # ── Messaging ─────────────────────────────────────────────────────────────
 
     def send_message(
@@ -90,6 +99,7 @@ class BaseAgent:
             db_path=self.db_path,
         )
         logger.debug(f"[{self.agent_id}] → [{recipient}] {subject} (id={msg_id[:8]})")
+        self._log("sent", f"→ {recipient}: {subject[:80]}")
         return msg_id
 
     def receive_messages(self, limit: int = 10) -> list[AgentMessage]:
@@ -119,6 +129,8 @@ class BaseAgent:
         Send a message to Claude and return the text response.
         Maintains a rolling short-term context window.
         """
+        self._log("thinking", user_message[:120])
+
         # Retrieve relevant memories
         memories = self.memory.search(user_message[:200], n_results=3)
         memory_context = ""
@@ -158,14 +170,20 @@ class BaseAgent:
             assistant_text = self._process_response(response, kwargs)
 
             self._message_history.append({"role": "assistant", "content": assistant_text})
+            self._log(
+                "responded",
+                f"({self._last_response_time:.1f}s) {assistant_text[:120]}",
+            )
             return assistant_text
 
         except anthropic.RateLimitError:
             logger.warning(f"[{self.agent_id}] Rate limit hit, waiting 30s")
+            self._log("error", "Rate limit — waiting 30s")
             time.sleep(30)
             return self._call_llm(user_message, additional_context)
         except Exception as e:
             self._error_count += 1
+            self._log("error", str(e)[:200])
             logger.error(f"[{self.agent_id}] LLM error: {e}")
             raise
 
@@ -190,6 +208,7 @@ class BaseAgent:
         # Execute tools and get final response
         tool_results = []
         for tb in tool_use_blocks:
+            self._log("tool_call", f"{tb.name}({str(tb.input)[:80]})")
             result = self._execute_tool(tb.name, tb.input)
             tool_results.append({
                 "type": "tool_result",
@@ -322,11 +341,16 @@ class BaseAgent:
         messages = self.receive_messages()
         responses = []
         for msg in messages:
+            self._log(
+                "received",
+                f"← {msg.sender}: {msg.subject[:80]}",
+            )
             try:
                 resp_id = self.handle_message(msg)
                 if resp_id:
                     responses.append(resp_id)
             except Exception as e:
+                self._log("error", f"handling '{msg.subject[:60]}': {str(e)[:100]}")
                 logger.error(f"[{self.agent_id}] Error handling message {msg.message_id}: {e}")
         return responses
 
@@ -343,6 +367,7 @@ class BaseAgent:
         Run a free-form task and return the LLM response.
         The workhorse method for directive-driven agents.
         """
+        self._log("task_start", task_description[:120])
         logger.info(f"[{self.agent_id}] Running task: {task_description[:80]}")
         response = self._call_llm(task_description, additional_context=context)
         # Store the task and response in long-term memory

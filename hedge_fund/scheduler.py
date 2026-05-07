@@ -144,6 +144,66 @@ class HedgeFundOrchestrator:
                 break  # No more messages to process
         return total
 
+    def drain_messages(
+        self,
+        max_rounds: int = 10,
+        callback=None,
+    ) -> dict:
+        """
+        Flush the message bus until all queues are empty or max_rounds is hit.
+        Safer than flush_messages() for interactive use — keeps going until done.
+
+        callback: optional callable(round_num, round_detail) for live progress.
+        Returns: {"rounds": N, "total_processed": N, "round_detail": [...]}
+        """
+        from hedge_fund.messaging.bus import total_pending_messages, all_queue_depths
+        rounds_detail = []
+        total = 0
+
+        for round_num in range(1, max_rounds + 1):
+            pending_before = total_pending_messages(db_path=self.cio.db_path)
+            if pending_before == 0:
+                break
+
+            round_activity: dict[str, int] = {}
+            for agent_id, agent in self._agents.items():
+                try:
+                    msgs = agent.process_inbox()
+                    if msgs:
+                        round_activity[agent_id] = len(msgs)
+                except Exception as e:
+                    logger.error(f"drain: {agent_id} error: {e}")
+
+            round_total = sum(round_activity.values())
+            total += round_total
+            detail = {
+                "round": round_num,
+                "responses_sent": round_total,
+                "active_agents": round_activity,
+                "pending_after": total_pending_messages(db_path=self.cio.db_path),
+            }
+            rounds_detail.append(detail)
+            logger.info(
+                f"Drain round {round_num}: {round_total} responses from "
+                f"{list(round_activity.keys())}"
+            )
+
+            if callback:
+                try:
+                    callback(round_num, detail)
+                except Exception:
+                    pass
+
+            if round_total == 0:
+                break
+
+        return {
+            "rounds": len(rounds_detail),
+            "total_processed": total,
+            "round_detail": rounds_detail,
+            "queues_empty": total_pending_messages(db_path=self.cio.db_path) == 0,
+        }
+
     # ── Daily Cycle ───────────────────────────────────────────────────────────
 
     def run_daily_cycle(self) -> dict:

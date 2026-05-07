@@ -75,21 +75,143 @@ def cmd_directive(orch, directive: str, priority: str = "normal") -> None:
     print(f"Processed {n} messages through the org.\n")
 
 
+_ACTIVITY_ICONS = {
+    "thinking":   "🧠",
+    "responded":  "✅",
+    "sent":       "📤",
+    "received":   "📥",
+    "tool_call":  "🔧",
+    "task_start": "🎯",
+    "error":      "❌",
+}
+
+
+def cmd_status(orch) -> None:
+    """Show a snapshot of what every agent is currently up to."""
+    from hedge_fund.messaging.bus import all_queue_depths, get_activity_feed, total_pending_messages
+    depths = all_queue_depths()
+    total = total_pending_messages()
+    feed = get_activity_feed(limit=20)
+
+    print(f"\n{'='*60}")
+    print("  AGENT STATUS SNAPSHOT")
+    print(f"{'='*60}")
+    print(f"  Total pending messages: {total}")
+    if depths:
+        print("\n  Inbox queue depths (agents with pending messages):")
+        for agent, depth in sorted(depths.items()):
+            bar = "█" * min(depth, 20)
+            print(f"    {agent:<30} {depth:>3} {bar}")
+    else:
+        print("\n  All inboxes empty — no pending messages.")
+
+    print(f"\n  Last 20 activity events:")
+    print(f"  {'Time':<10} {'Agent':<28} {'Event':<12} Details")
+    print(f"  {'-'*9} {'-'*27} {'-'*11} {'-'*30}")
+    for entry in feed:
+        icon = _ACTIVITY_ICONS.get(entry.get("event_type", ""), "•")
+        ts = entry.get("timestamp", "")[-8:]  # HH:MM:SS
+        agent = entry.get("agent_id", "")[:27]
+        et = (icon + " " + entry.get("event_type", ""))[:11]
+        details = entry.get("details", "")[:60]
+        print(f"  {ts:<10} {agent:<28} {et:<12} {details}")
+    print()
+
+
+def cmd_watch(orch, max_rounds: int = 10) -> None:
+    """
+    Drain the message bus while printing live activity.
+    Keeps flushing until all queues are empty (or max_rounds hit).
+    """
+    from hedge_fund.messaging.bus import total_pending_messages
+
+    pending = total_pending_messages()
+    print(f"\n=== WATCH MODE === ({pending} messages pending)")
+    print("Processing agents... (Ctrl+C to stop)\n")
+
+    last_seen_activity_id = 0
+
+    def show_new_activity():
+        nonlocal last_seen_activity_id
+        from hedge_fund.messaging.bus import get_activity_feed
+        # Get activities we haven't shown yet
+        feed = get_activity_feed(limit=30)
+        new_entries = [e for e in reversed(feed) if e["id"] > last_seen_activity_id]
+        for entry in new_entries:
+            icon = _ACTIVITY_ICONS.get(entry.get("event_type", ""), "•")
+            ts = entry.get("timestamp", "")[-8:]
+            agent = entry.get("agent_id", "")
+            details = entry.get("details", "")[:80]
+            print(f"  {ts} [{agent}] {icon} {details}")
+        if new_entries:
+            last_seen_activity_id = new_entries[-1]["id"]
+
+    def round_callback(round_num, detail):
+        show_new_activity()
+        pending_after = detail.get("pending_after", 0)
+        active = detail.get("active_agents", {})
+        if active:
+            print(f"\n  ── Round {round_num} complete: "
+                  f"{detail['responses_sent']} responses | "
+                  f"{pending_after} still pending ──\n")
+
+    try:
+        result = orch.drain_messages(max_rounds=max_rounds, callback=round_callback)
+        show_new_activity()
+    except KeyboardInterrupt:
+        print("\nWatch interrupted.")
+        return
+
+    print(f"\n{'='*50}")
+    if result["queues_empty"]:
+        print(f"  Done. {result['total_processed']} total responses, "
+              f"{result['rounds']} rounds. All queues empty.")
+    else:
+        remaining = total_pending_messages()
+        print(f"  Stopped after {result['rounds']} rounds. "
+              f"{remaining} messages still pending. Run 'watch' again to continue.")
+    print()
+
+
+def cmd_activity(orch, agent_id: str = "", limit: int = 30) -> None:
+    """Print recent activity log entries, optionally filtered by agent."""
+    from hedge_fund.messaging.bus import get_activity_feed
+    feed = get_activity_feed(
+        limit=limit,
+        agent_id=agent_id or None,
+    )
+    label = f"for [{agent_id}]" if agent_id else "(all agents)"
+    print(f"\nActivity log {label} — {len(feed)} events (newest first):")
+    print(f"{'Time':<10} {'Agent':<28} {'Event':<12} Details")
+    print(f"{'-'*9} {'-'*27} {'-'*11} {'-'*30}")
+    for entry in feed:
+        icon = _ACTIVITY_ICONS.get(entry.get("event_type", ""), "•")
+        ts = entry.get("timestamp", "")[-8:]
+        agent = entry.get("agent_id", "")[:27]
+        et = (icon + " " + entry.get("event_type", ""))[:11]
+        details = entry.get("details", "")[:70]
+        print(f"{ts:<10} {agent:<28} {et:<12} {details}")
+    print()
+
+
 def cmd_cli(orch) -> None:
     """Interactive CEO CLI."""
     print("\n" + "=" * 60)
     print("  AI HEDGE FUND — CEO TERMINAL")
     print("=" * 60)
     print("Commands:")
-    print("  directive <text>  — Issue a directive to the CIO")
-    print("  cycle             — Run the daily cycle")
-    print("  memo              — Get CIO morning memo")
-    print("  risk              — Get CRO risk report")
-    print("  pnl               — Get CFO P&L report")
-    print("  portfolio         — Show current positions")
-    print("  audit             — Show recent audit log")
-    print("  flush             — Flush the message bus")
-    print("  quit              — Exit")
+    print("  directive <text>      — Issue a directive to the CIO")
+    print("  watch                 — Drain message bus + show live activity")
+    print("  status                — Show agent queue depths + recent activity")
+    print("  activity [agent_id]   — Print activity log (all or one agent)")
+    print("  cycle                 — Run the full daily cycle")
+    print("  memo                  — Get CIO morning memo")
+    print("  risk                  — Get CRO risk report")
+    print("  pnl                   — Get CFO P&L report")
+    print("  portfolio             — Show current positions")
+    print("  audit                 — Show recent message audit log")
+    print("  flush                 — Quick flush (3 rounds, no output)")
+    print("  quit                  — Exit")
     print("=" * 60 + "\n")
 
     while True:
@@ -109,8 +231,21 @@ def cmd_cli(orch) -> None:
         if action in ("quit", "exit", "q"):
             break
 
-        elif action == "directive" and args:
-            cmd_directive(orch, args)
+        elif action == "directive":
+            if args:
+                cmd_directive(orch, args)
+                print("Tip: run 'watch' to see agents process the directive.\n")
+            else:
+                print("Usage: directive <your directive text>\n")
+
+        elif action == "watch":
+            cmd_watch(orch)
+
+        elif action == "status":
+            cmd_status(orch)
+
+        elif action == "activity":
+            cmd_activity(orch, agent_id=args.strip())
 
         elif action == "cycle":
             cmd_cycle(orch)
@@ -155,7 +290,7 @@ def cmd_cli(orch) -> None:
         elif action == "audit":
             from hedge_fund.messaging.bus import get_audit_log
             log = get_audit_log(limit=10)
-            print(f"\nRecent audit log ({len(log)} records):")
+            print(f"\nRecent message audit log ({len(log)} records):")
             for entry in log:
                 print(
                     f"  [{entry['timestamp'][:16]}] "
@@ -166,10 +301,10 @@ def cmd_cli(orch) -> None:
 
         elif action == "flush":
             n = orch.flush_messages(rounds=3)
-            print(f"Processed {n} messages.\n")
+            print(f"Flushed {n} messages. Run 'status' to see queue depths.\n")
 
         else:
-            print(f"Unknown command: {action}. Type 'quit' to exit.\n")
+            print(f"Unknown command: '{action}'. Type 'quit' to exit.\n")
 
 
 def main() -> None:
