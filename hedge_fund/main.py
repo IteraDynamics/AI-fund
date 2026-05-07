@@ -76,13 +76,25 @@ def cmd_directive(orch, directive: str, priority: str = "normal") -> None:
 
 
 _ACTIVITY_ICONS = {
-    "thinking":   "🧠",
-    "responded":  "✅",
-    "sent":       "📤",
-    "received":   "📥",
-    "tool_call":  "🔧",
-    "task_start": "🎯",
-    "error":      "❌",
+    "thinking":              "🧠",
+    "responded":             "✅",
+    "sent":                  "📤",
+    "received":              "📥",
+    "tool_call":             "🔧",
+    "task_start":            "🎯",
+    "error":                 "❌",
+    "trade_created":         "💡",
+    "trade_executed":        "💰",
+    "compliance_submitted":  "📋",
+    "compliance_approved":   "✅",
+    "compliance_rejected":   "🚫",
+    "risk_submitted":        "⚖️",
+    "risk_approved":         "✅",
+    "risk_vetoed":           "🛑",
+    "synthesizing":          "🔬",
+    "research_received":     "📊",
+    "cio_approval_requested":"👔",
+    "trade_skipped":         "⏭️",
 }
 
 
@@ -173,6 +185,46 @@ def cmd_watch(orch, max_rounds: int = 10) -> None:
     print()
 
 
+def cmd_trade(orch, mandate: str = "") -> None:
+    """
+    Force all PMs to synthesize trade recommendations immediately
+    (bypasses analyst research round-trip — uses memory + LLM knowledge).
+    Then drains the message bus so compliance/risk checks execute.
+    """
+    print(f"\n=== GENERATE TRADES NOW ===")
+    if mandate:
+        print(f"Mandate: {mandate}\n")
+    else:
+        print("No mandate provided — each PM will use its default strategy.\n")
+
+    summary = orch.generate_trades_now(mandate=mandate)
+    print("PM synthesis results:")
+    for pm_id, result in summary.items():
+        print(f"  {pm_id:<25} → {result}")
+
+    print("\nDraining message bus (compliance + risk checks)...")
+    result = orch.drain_messages(max_rounds=8)
+    print(f"Done: {result['total_processed']} messages processed in {result['rounds']} rounds.")
+    if result["queues_empty"]:
+        print("All queues empty — trades have been submitted through the pipeline.\n")
+    else:
+        print("Some messages still pending. Run 'watch' to continue draining.\n")
+
+    # Print any new trade recommendations
+    from hedge_fund.memory.shared_state import get_recommendations
+    recs = get_recommendations(status_filter=None)
+    if recs:
+        print(f"Trade recommendations in system ({len(recs)} total):")
+        for r in recs[-10:]:  # last 10
+            print(
+                f"  [{r.status.value:<22}] {r.direction.value.upper()} "
+                f"{r.ticker} ${r.notional_usd:,.0f}  (id={r.recommendation_id[:8]})"
+            )
+        print()
+    else:
+        print("No trade recommendations in system yet.\n")
+
+
 def cmd_activity(orch, agent_id: str = "", limit: int = 30) -> None:
     """Print recent activity log entries, optionally filtered by agent."""
     from hedge_fund.messaging.bus import get_activity_feed
@@ -210,6 +262,7 @@ def cmd_cli(orch) -> None:
     print("  pnl                   — Get CFO P&L report")
     print("  portfolio             — Show current positions")
     print("  audit                 — Show recent message audit log")
+    print("  trade [mandate]       — Force all PMs to generate trades NOW (bypass analysts)")
     print("  flush                 — Quick flush (3 rounds, no output)")
     print("  quit                  — Exit")
     print("=" * 60 + "\n")
@@ -299,6 +352,9 @@ def cmd_cli(orch) -> None:
                 )
             print()
 
+        elif action == "trade":
+            cmd_trade(orch, mandate=args.strip())
+
         elif action == "flush":
             n = orch.flush_messages(rounds=3)
             print(f"Flushed {n} messages. Run 'status' to see queue depths.\n")
@@ -313,6 +369,8 @@ def main() -> None:
     parser.add_argument("--scheduler", action="store_true", help="Start scheduler")
     parser.add_argument("--directive", type=str, help="Issue a CEO directive")
     parser.add_argument("--priority", type=str, default="normal", help="Directive priority")
+    parser.add_argument("--trade", type=str, nargs="?", const="", metavar="MANDATE",
+                        help="Force PMs to generate trades now (optional mandate text)")
     parser.add_argument("--cli", action="store_true", help="Interactive CLI mode")
     args = parser.parse_args()
 
@@ -322,6 +380,8 @@ def main() -> None:
         cmd_cycle(orch)
     elif args.directive:
         cmd_directive(orch, args.directive, args.priority)
+    elif args.trade is not None:
+        cmd_trade(orch, mandate=args.trade)
     elif args.scheduler:
         print("Starting scheduler...")
         orch.start_scheduler()

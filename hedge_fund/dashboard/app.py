@@ -49,22 +49,46 @@ st.set_page_config(
 
 # ── Event type styling ────────────────────────────────────────────────────────
 EVENT_ICON = {
-    "thinking":   "🧠",
-    "responded":  "✅",
-    "sent":       "📤",
-    "received":   "📥",
-    "tool_call":  "🔧",
-    "task_start": "🎯",
-    "error":      "❌",
+    "thinking":              "🧠",
+    "responded":             "✅",
+    "sent":                  "📤",
+    "received":              "📥",
+    "tool_call":             "🔧",
+    "task_start":            "🎯",
+    "error":                 "❌",
+    "trade_created":         "💡",
+    "trade_executed":        "💰",
+    "compliance_submitted":  "📋",
+    "compliance_approved":   "✅",
+    "compliance_rejected":   "🚫",
+    "risk_submitted":        "⚖️",
+    "risk_approved":         "✅",
+    "risk_vetoed":           "🛑",
+    "synthesizing":          "🔬",
+    "research_received":     "📊",
+    "cio_approval_requested":"👔",
+    "trade_skipped":         "⏭️",
 }
 EVENT_COLOR = {
-    "thinking":   "#d0e8ff",
-    "responded":  "#d4edda",
-    "sent":       "#fff3cd",
-    "received":   "#e2e3e5",
-    "tool_call":  "#f8d7da",
-    "task_start": "#cfe2ff",
-    "error":      "#f8d7da",
+    "thinking":              "#d0e8ff",
+    "responded":             "#d4edda",
+    "sent":                  "#fff3cd",
+    "received":              "#e2e3e5",
+    "tool_call":             "#f0d9ff",
+    "task_start":            "#cfe2ff",
+    "error":                 "#f8d7da",
+    "trade_created":         "#d1f0d1",
+    "trade_executed":        "#a8e6a8",
+    "compliance_submitted":  "#fff3cd",
+    "compliance_approved":   "#d4edda",
+    "compliance_rejected":   "#f8d7da",
+    "risk_submitted":        "#fff3cd",
+    "risk_approved":         "#d4edda",
+    "risk_vetoed":           "#f8d7da",
+    "synthesizing":          "#e8d5f0",
+    "research_received":     "#d0e8ff",
+    "cio_approval_requested":"#fce8b2",
+    "trade_skipped":         "#e2e3e5",
 }
 
 
@@ -540,61 +564,125 @@ elif page == "Risk":
 
 # ════════════════════════════════════════════════════════════════════════════════
 elif page == "Trade Approvals":
-    st.header("Trade Approval Queue")
+    st.header("Trade Pipeline")
     st.caption(
-        "Trades that have cleared Compliance and the CRO are shown here. "
-        "Large trades (> $50k notional) land in PENDING_CIO and need your explicit approval."
+        "Full trade pipeline visibility: every recommendation from PM synthesis through "
+        "Compliance → CRO → CIO approval → execution. "
+        "Large trades (> $50k notional) stop at **PENDING_CIO** for your approval."
     )
 
+    # ── Generate Trades Now ───────────────────────────────────────────────────
+    with st.expander("⚡ Force PMs to Generate Trades Now", expanded=False):
+        st.caption(
+            "Bypass the analyst research round-trip. Each PM immediately synthesizes "
+            "a trade from memory and LLM knowledge, then submits through compliance → risk."
+        )
+        mandate_input = st.text_input(
+            "Optional mandate (leave blank for each PM's default strategy)",
+            placeholder="e.g. 'Focus on energy sector longs given supply squeeze'",
+            key="force_trade_mandate",
+        )
+        if st.button("Generate Trades Now", type="primary", key="btn_generate_trades"):
+            with st.spinner("PMs synthesizing trades..."):
+                try:
+                    summary = orch.generate_trades_now(mandate=mandate_input.strip())
+                    for pm_id, result in summary.items():
+                        icon = "✅" if "none" not in result and "error" not in result else (
+                            "⚠️" if "none" in result else "❌"
+                        )
+                        st.write(f"{icon} **{pm_id}**: {result}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            with st.spinner("Running compliance + risk checks..."):
+                drain_result = orch.drain_messages(max_rounds=8)
+            st.success(
+                f"Done. {drain_result['total_processed']} messages processed. "
+                f"Refresh the page to see updated pipeline status."
+            )
+            st.rerun()
+
+    st.divider()
+
+    # ── Pipeline Status Bar ───────────────────────────────────────────────────
+    _PIPELINE_STAGES = [
+        ("pending_compliance", "Compliance", "🔍"),
+        ("pending_risk",       "Risk Check", "⚖️"),
+        ("pending_cio",        "CIO Approval", "👔"),
+        ("approved",           "Approved",   "✅"),
+        ("rejected",           "Rejected",   "❌"),
+        ("executed",           "Executed",   "💰"),
+    ]
     try:
-        for status in ["pending_cio", "approved", "rejected", "executed"]:
-            recs = get_recommendations(status=status)
+        all_recs = get_recommendations()
+        counts = {s: 0 for s, _, _ in _PIPELINE_STAGES}
+        for r in all_recs:
+            s = r.get("status", "")
+            if s in counts:
+                counts[s] += 1
+
+        cols = st.columns(len(_PIPELINE_STAGES))
+        for col, (status_key, label, icon) in zip(cols, _PIPELINE_STAGES):
+            with col:
+                st.metric(f"{icon} {label}", counts[status_key])
+
+        st.divider()
+
+        # ── Per-Stage Details ─────────────────────────────────────────────────
+        for status_key, label, icon in _PIPELINE_STAGES:
+            recs = [r for r in all_recs if r.get("status") == status_key]
             if not recs:
                 continue
-            st.subheader(f"{status.replace('_', ' ').upper()} ({len(recs)})")
+            st.subheader(f"{icon} {label} ({len(recs)})")
             for rec in recs[:10]:
+                expand = (status_key == "pending_cio")
                 with st.expander(
-                    f"{rec['direction'].upper()} {rec['ticker']} — "
-                    f"${rec['target_notional_usd']:,.0f} | "
-                    f"Confidence: {rec['confidence_score']:.2f}",
-                    expanded=(status == "pending_cio"),
+                    f"{rec['direction'].upper()} **{rec['ticker']}** — "
+                    f"${rec['target_notional_usd']:,.0f} notional | "
+                    f"PM: {rec['pm_id']} | "
+                    f"Confidence: {rec['confidence_score']:.0%}",
+                    expanded=expand,
                 ):
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.write(f"**PM:** {rec['pm_id']}")
                         st.write(f"**Size:** {rec['target_pct_nav']:.1%} of NAV")
-                        st.write(f"**Expected Return:** {rec['expected_return_pct']:.1%}")
-                        st.write(f"**Stop Loss:** {rec['stop_loss_pct']:.1%}")
-                        st.write(f"**Take Profit:** {rec['take_profit_pct']:.1%}")
+                        st.write(f"**Expected return:** {rec['expected_return_pct']:.1%}")
+                        st.write(f"**Stop loss:** {rec['stop_loss_pct']:.1%}")
+                        st.write(f"**Take profit:** {rec['take_profit_pct']:.1%}")
                         st.write(f"**Horizon:** {rec['time_horizon_days']} days")
+                        st.write(f"**Asset class:** {rec.get('asset_class', 'N/A')}")
                     with col2:
-                        st.write(f"**Rationale:** {rec['rationale'][:300]}")
-                        st.write(f"**Status:** {rec['status']}")
-                        st.write(f"**Submitted:** {rec['timestamp']}")
+                        st.write(f"**Rationale:**")
+                        st.write(rec['rationale'][:400])
+                        st.caption(f"Submitted: {rec['timestamp']} | ID: {rec['rec_id'][:12]}")
 
-                    if status == "pending_cio":
+                    if status_key == "pending_cio":
+                        st.markdown("---")
+                        st.markdown("**Your action required** — this trade exceeded the $50k threshold.")
                         c1, c2 = st.columns(2)
                         with c1:
-                            if st.button(f"✅ Approve", key=f"approve_{rec['rec_id']}"):
+                            if st.button("✅ Approve", key=f"approve_{rec['rec_id']}"):
                                 from hedge_fund.memory.shared_state import update_recommendation_status
                                 update_recommendation_status(rec['rec_id'], "approved")
-                                st.success("Trade approved.")
+                                st.success("Trade approved — PM will execute on next flush.")
                                 st.rerun()
                         with c2:
-                            if st.button(f"❌ Veto", key=f"veto_{rec['rec_id']}"):
+                            if st.button("❌ Veto", key=f"veto_{rec['rec_id']}"):
                                 from hedge_fund.memory.shared_state import update_recommendation_status
                                 update_recommendation_status(rec['rec_id'], "rejected")
                                 st.error("Trade vetoed.")
                                 st.rerun()
 
-        all_recs = get_recommendations()
         if not all_recs:
             st.info(
-                "No trade recommendations yet. Issue a directive, drain the message bus, "
-                "and recommendations will appear here once PMs synthesize research."
+                "No trade recommendations in the pipeline yet.\n\n"
+                "**To generate trades:**\n"
+                "1. Use the **⚡ Force PMs to Generate Trades Now** section above, or\n"
+                "2. Issue a directive on the **Issue Directive** page and drain the message bus.\n\n"
+                "Trades will appear here as they move through Compliance → Risk → CIO → Execution."
             )
+
     except Exception as e:
-        st.error(f"Error loading recommendations: {e}")
+        st.error(f"Error loading trade pipeline: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

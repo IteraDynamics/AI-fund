@@ -121,6 +121,30 @@ class HedgeFundOrchestrator:
         """Request the COO's operational status."""
         return self.coo.produce_ops_report()
 
+    def generate_trades_now(self, mandate: str = "") -> dict:
+        """
+        Force all PMs to immediately synthesize trade recommendations from
+        memory and LLM knowledge — bypassing the analyst research round-trip.
+
+        Returns a summary dict: {pm_id: trade_ticker or "none" or "error"}.
+        """
+        summary: dict[str, str] = {}
+        pms = [
+            ("pm_longshort", self.pm_longshort),
+            ("pm_macro", self.pm_macro),
+            ("pm_quant", self.pm_quant),
+            ("pm_eventdriven", self.pm_eventdriven),
+        ]
+        for pm_id, pm in pms:
+            try:
+                rec = pm.synthesize_now(mandate=mandate or None)
+                summary[pm_id] = f"{rec.direction.value.upper()} {rec.ticker}" if rec else "none"
+                logger.info(f"generate_trades_now: {pm_id} → {summary[pm_id]}")
+            except Exception as e:
+                summary[pm_id] = f"error: {e}"
+                logger.error(f"generate_trades_now: {pm_id} error: {e}")
+        return summary
+
     # ── Message Bus Flush ─────────────────────────────────────────────────────
 
     def flush_messages(self, rounds: int = 3) -> int:
