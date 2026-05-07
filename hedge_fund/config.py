@@ -4,6 +4,9 @@ All API keys and operational parameters live here.
 Set environment variables or populate .env before running.
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 from pathlib import Path
 
@@ -14,10 +17,22 @@ DATA_DIR.mkdir(exist_ok=True)
 # ── API Keys ──────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+GROK_API_KEY: str = os.getenv("GROK_API_KEY", "")
 
-# ── Claude Model ──────────────────────────────────────────────────────────────
-CLAUDE_MODEL: str = "claude-sonnet-4-5"
+# ── LLM Provider & Models ─────────────────────────────────────────────────────
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+
+# Anthropic settings
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 CLAUDE_MAX_TOKENS: int = 4096
+
+# Ollama settings (local, free)
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+# Grok/xAI settings
+GROK_BASE_URL: str = os.getenv("GROK_BASE_URL", "https://api.x.ai/v1")
+GROK_MODEL: str = os.getenv("GROK_MODEL", "grok-3-mini")
 
 # ── Database Paths ────────────────────────────────────────────────────────────
 PORTFOLIO_DB_PATH: str = str(DATA_DIR / "portfolio.db")

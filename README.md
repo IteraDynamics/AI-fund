@@ -457,7 +457,9 @@ The high-water mark starts at $10M and only moves up — performance fees are on
 ### 1. Prerequisites
 
 - Python 3.11+
-- An Anthropic API key with access to `claude-sonnet-4-5`
+- Either:
+  - local Ollama (free), or
+  - an Anthropic API key with access to `claude-sonnet-4-5`
 - (Optional) An Alpha Vantage API key for news sentiment
 
 ### 2. Clone and install
@@ -477,7 +479,10 @@ cp .env.example .env
 Edit `.env`:
 
 ```
-ANTHROPIC_API_KEY=sk-ant-api03-...
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.1:8b
+ANTHROPIC_API_KEY=               # only required when LLM_PROVIDER=anthropic
 ALPHA_VANTAGE_API_KEY=          # optional
 LOG_LEVEL=INFO                   # DEBUG for verbose agent output
 ```
@@ -501,7 +506,7 @@ import sys; sys.path.insert(0, '.')
 from hedge_fund.messaging.bus import init_bus
 from hedge_fund.memory.shared_state import init_portfolio_db, get_nav
 init_bus(); init_portfolio_db()
-print(f'NAV: \${get_nav():,.0f}')
+print(f'NAV: ${get_nav():,.0f}')
 "
 ```
 
@@ -525,7 +530,7 @@ These are excluded from git (`.gitignore`). They persist between runs.
 The dashboard is your primary interface. Launch it with:
 
 ```bash
-streamlit run hedge_fund/dashboard/app.py
+python -m streamlit run hedge_fund/dashboard/app.py
 ```
 
 It opens in your browser at `http://localhost:8501`.
@@ -752,7 +757,10 @@ All configuration lives in `hedge_fund/config.py`. Edit these values directly or
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Required. Your Anthropic API key |
+| `LLM_PROVIDER` | `anthropic` | LLM backend: `anthropic` or `ollama` |
+| `ANTHROPIC_API_KEY` | — | Required only when `LLM_PROVIDER=anthropic` |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama API base URL |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Local Ollama model tag |
 | `ALPHA_VANTAGE_API_KEY` | — | Optional. For news sentiment |
 | `CLAUDE_MODEL` | `claude-sonnet-4-5` | Claude model for all agents |
 | `CLAUDE_MAX_TOKENS` | `4096` | Max tokens per agent response |

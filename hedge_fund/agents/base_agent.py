@@ -24,9 +24,21 @@ from datetime import datetime
 from typing import Any, Optional, Type, TypeVar
 
 import anthropic
+import requests
 from pydantic import BaseModel
 
-from hedge_fund.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, AUDIT_DB_PATH
+from hedge_fund.config import (
+    ANTHROPIC_API_KEY,
+    AUDIT_DB_PATH,
+    CLAUDE_MAX_TOKENS,
+    CLAUDE_MODEL,
+    GROK_API_KEY,
+    GROK_BASE_URL,
+    GROK_MODEL,
+    LLM_PROVIDER,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+)
 from hedge_fund.memory.vector_store import AgentMemory
 from hedge_fund.messaging import bus as message_bus
 from hedge_fund.messaging.bus import log_activity
@@ -59,7 +71,34 @@ class BaseAgent:
 
     def __init__(self, db_path: str = AUDIT_DB_PATH) -> None:
         self.db_path = db_path
-        self._client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self._provider = LLM_PROVIDER
+        if self._provider == "anthropic":
+            if not ANTHROPIC_API_KEY:
+                raise ValueError(
+                    "ANTHROPIC_API_KEY is missing. "
+                    "Set it in your environment or switch to LLM_PROVIDER=ollama."
+                )
+            self._client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        elif self._provider == "ollama":
+            self._client = None
+            logger.info(
+                f"[{self.agent_id}] Using local Ollama model '{OLLAMA_MODEL}' at {OLLAMA_BASE_URL}"
+            )
+        elif self._provider == "grok":
+            if not GROK_API_KEY:
+                raise ValueError(
+                    "GROK_API_KEY is missing. "
+                    "Set it in your environment or switch LLM_PROVIDER."
+                )
+            self._client = None
+            logger.info(
+                f"[{self.agent_id}] Using Grok model '{GROK_MODEL}' at {GROK_BASE_URL}"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported LLM_PROVIDER='{self._provider}'. "
+                "Supported providers: anthropic, ollama, grok."
+            )
         self.memory = AgentMemory(self.agent_id)
         self._message_history: list[dict] = []  # short-term context
         self._start_time = datetime.utcnow()
@@ -151,23 +190,26 @@ class BaseAgent:
         if len(self._message_history) > self.max_context_messages * 2:
             self._message_history = self._message_history[-(self.max_context_messages * 2):]
 
-        kwargs: dict[str, Any] = {
-            "model": CLAUDE_MODEL,
-            "max_tokens": CLAUDE_MAX_TOKENS,
-            "system": self.system_prompt,
-            "messages": self._message_history,
-        }
-        if self.allowed_tools:
-            kwargs["tools"] = self.allowed_tools
-
         t0 = time.time()
         try:
-            response = self._client.messages.create(**kwargs)
+            if self._provider == "anthropic":
+                kwargs: dict[str, Any] = {
+                    "model": CLAUDE_MODEL,
+                    "max_tokens": CLAUDE_MAX_TOKENS,
+                    "system": self.system_prompt,
+                    "messages": self._message_history,
+                }
+                if self.allowed_tools:
+                    kwargs["tools"] = self.allowed_tools
+                response = self._client.messages.create(**kwargs)
+                assistant_text = self._process_response(response, kwargs)
+            elif self._provider == "grok":
+                assistant_text = self._call_grok()
+            else:
+                assistant_text = self._call_ollama()
+
             self._last_response_time = time.time() - t0
             self._task_count += 1
-
-            # Handle tool use blocks if present
-            assistant_text = self._process_response(response, kwargs)
 
             self._message_history.append({"role": "assistant", "content": assistant_text})
             self._log(
@@ -186,6 +228,54 @@ class BaseAgent:
             self._log("error", str(e)[:200])
             logger.error(f"[{self.agent_id}] LLM error: {e}")
             raise
+
+    def _call_ollama(self) -> str:
+        """
+        Call local Ollama chat API.
+        Note: this path currently does not support tool-calling.
+        """
+        url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                *self._message_history,
+            ],
+            "options": {
+                "temperature": 0.3,
+            },
+        }
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("message", {}).get("content", "").strip()
+
+    def _call_grok(self) -> str:
+        """
+        Call xAI Grok via OpenAI-compatible chat completions API.
+        Note: this path currently does not support tool-calling.
+        """
+        url = f"{GROK_BASE_URL.rstrip('/')}/chat/completions"
+        payload = {
+            "model": GROK_MODEL,
+            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                *self._message_history,
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {GROK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return ""
+        return choices[0].get("message", {}).get("content", "").strip()
 
     def _process_response(self, response, original_kwargs: dict) -> str:
         """
