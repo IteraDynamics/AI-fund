@@ -1,0 +1,14 @@
+anthropic>=0.40.0
+pydantic>=2.5.0
+chromadb>=0.4.22
+yfinance>=0.2.36
+pandas>=2.1.0
+numpy>=1.26.0
+scipy>=1.11.0
+scikit-learn>=1.4.0
+statsmodels>=0.14.0
+requests>=2.31.0
+streamlit>=1.31.0
+schedule>=1.2.1
+sec-edgar-downloader>=5.0.3
+matplotlib>=3.8.0
