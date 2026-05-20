@@ -360,9 +360,24 @@ class HedgeFundOrchestrator:
         """
         Start the blocking daily scheduler.
         Runs the daily cycle at DAILY_CYCLE_HOUR:DAILY_CYCLE_MINUTE every day.
+        Handles SIGTERM/SIGINT for clean shutdown after the current job finishes.
         """
+        import signal
         import schedule
         from hedge_fund.config import DAILY_CYCLE_HOUR, DAILY_CYCLE_MINUTE
+
+        _running = True
+
+        def _handle_shutdown(signum, frame):
+            nonlocal _running
+            logger.info(
+                f"Shutdown signal {signum} received — "
+                "finishing current job then stopping cleanly."
+            )
+            _running = False
+
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
 
         cycle_time = f"{DAILY_CYCLE_HOUR:02d}:{DAILY_CYCLE_MINUTE:02d}"
         logger.info(f"Scheduler started. Daily cycle at {cycle_time} UTC.")
@@ -373,6 +388,8 @@ class HedgeFundOrchestrator:
         # Process message bus every 5 minutes
         schedule.every(5).minutes.do(lambda: self.flush_messages(rounds=1))
 
-        while True:
+        while _running:
             schedule.run_pending()
             time.sleep(30)
+
+        logger.info("Scheduler stopped cleanly.")

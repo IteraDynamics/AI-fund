@@ -15,42 +15,49 @@ import yfinance as yf
 from hedge_fund.config import ALPHA_VANTAGE_API_KEY
 
 
-def get_current_price(ticker: str) -> Optional[float]:
+def get_current_price(ticker: str, retries: int = 3) -> Optional[float]:
     """Return latest close price for a ticker."""
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="2d")
-        if hist.empty:
-            return None
-        return float(hist["Close"].iloc[-1])
-    except Exception:
-        return None
+    for attempt in range(retries):
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="2d")
+            if hist.empty:
+                return None
+            return float(hist["Close"].iloc[-1])
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return None
 
 
 def get_price_history(
     ticker: str,
     period: str = "1y",
     interval: str = "1d",
+    retries: int = 3,
 ) -> Optional[list[dict]]:
     """Return list of OHLCV dicts for a ticker."""
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period=period, interval=interval)
-        if hist.empty:
-            return None
-        records = []
-        for dt, row in hist.iterrows():
-            records.append({
-                "date": dt.isoformat(),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": float(row["Volume"]),
-            })
-        return records
-    except Exception:
-        return None
+    for attempt in range(retries):
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period=period, interval=interval)
+            if hist.empty:
+                return None
+            records = []
+            for dt, row in hist.iterrows():
+                records.append({
+                    "date": dt.isoformat(),
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                    "volume": float(row["Volume"]),
+                })
+            return records
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return None
 
 
 def get_fundamentals(ticker: str) -> dict:

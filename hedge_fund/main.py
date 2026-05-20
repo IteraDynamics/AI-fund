@@ -212,13 +212,13 @@ def cmd_trade(orch, mandate: str = "") -> None:
 
     # Print any new trade recommendations
     from hedge_fund.memory.shared_state import get_recommendations
-    recs = get_recommendations(status_filter=None)
+    recs = get_recommendations(status=None)
     if recs:
         print(f"Trade recommendations in system ({len(recs)} total):")
         for r in recs[-10:]:  # last 10
             print(
-                f"  [{r.status.value:<22}] {r.direction.value.upper()} "
-                f"{r.ticker} ${r.notional_usd:,.0f}  (id={r.recommendation_id[:8]})"
+                f"  [{r['status']:<22}] {r['direction'].upper()} "
+                f"{r['ticker']} ${r['target_notional_usd']:,.0f}  (id={r['rec_id'][:8]})"
             )
         print()
     else:

@@ -18,7 +18,7 @@ from typing import Optional
 from hedge_fund.agents.base_agent import BaseAgent
 from hedge_fund.config import INITIAL_NAV, AUDIT_DB_PATH
 from hedge_fund.memory.shared_state import (
-    get_positions, get_nav, get_cash, update_nav,
+    get_positions, get_nav, get_cash, update_nav, update_cash,
     upsert_position, get_blotter, compute_risk_metrics,
 )
 from hedge_fund.models.schemas import (
@@ -131,6 +131,13 @@ Always include confidence in your calculations and flag any data quality issues.
             self._high_water_mark = max(self._high_water_mark, nav)
 
         total_fee = daily_mgmt_fee + perf_fee_accrual
+
+        # Deduct fees from cash and NAV so they actually impact performance
+        if total_fee > 0:
+            update_cash(cash - total_fee)
+            update_nav(nav - total_fee)
+            cash = cash - total_fee
+            nav = nav - total_fee
 
         # Pod P&L from risk metrics
         pod_pnl = metrics.get("pod_pnl", {})

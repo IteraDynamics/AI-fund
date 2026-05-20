@@ -160,6 +160,12 @@ def set_halt(halted: bool, db_path: str = PORTFOLIO_DB_PATH) -> None:
                       ("true" if halted else "false",))
 
 
+def update_cash(new_cash: float, db_path: str = PORTFOLIO_DB_PATH) -> None:
+    with _lock:
+        with _conn(db_path) as c:
+            c.execute("UPDATE fund_state SET value=? WHERE key='cash'", (str(new_cash),))
+
+
 def update_nav(new_nav: float, db_path: str = PORTFOLIO_DB_PATH) -> None:
     with _lock:
         with _conn(db_path) as c:

@@ -136,6 +136,14 @@ Format as JSON:
             body=summary,
             priority=priority,
         )
+
+        # Acknowledge directive to CEO with decomposition plan
+        self.send_message(
+            recipient="ceo",
+            subject=f"CIO: Directive Acknowledged [{directive_id}]",
+            body=summary,
+            priority=priority,
+        )
         return summary
 
     def _dispatch_pm_tasks(self, plan: dict, original_directive: str, directive_id: str) -> None:
@@ -305,12 +313,30 @@ Format as JSON:
                 priority=MessagePriority.HIGH,
             )
 
-        # PM research responses — synthesize and send summary to CEO
-        if message.sender.startswith("pm_") and message.requires_reply is False:
+        # Trade execution notifications from PMs — forward to CEO
+        if message.subject.startswith("TRADE_EXECUTED:"):
+            self.remember(
+                f"TRADE EXECUTED by {message.sender}: {message.body[:200]}",
+                metadata={"type": "trade_executed", "pm": message.sender},
+            )
+            return self.send_message(
+                recipient="ceo",
+                subject=f"Trade Executed — {message.sender.upper()}",
+                body=message.body,
+                priority=MessagePriority.HIGH,
+            )
+
+        # PM responses to CIO tasks — forward brief status to CEO
+        if message.sender.startswith("pm_"):
             self.remember(
                 f"PM RESPONSE from {message.sender}: {message.body[:300]}",
                 metadata={"type": "pm_research", "pm": message.sender},
             )
-            return None  # accumulate; memo will be produced at end of cycle
+            return self.send_message(
+                recipient="ceo",
+                subject=f"PM Update — {message.sender}",
+                body=message.body[:400],
+                priority=MessagePriority.LOW,
+            )
 
         return None

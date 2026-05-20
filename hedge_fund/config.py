@@ -23,7 +23,7 @@ GROK_API_KEY: str = os.getenv("GROK_API_KEY", "")
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
 # Anthropic settings
-CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MAX_TOKENS: int = 4096
 
 # Ollama settings (local, free)

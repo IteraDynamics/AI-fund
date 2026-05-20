@@ -164,8 +164,10 @@ Respond as JSON:
                     veto_reason = d.get("veto_reason", "CRO qualitative veto")
                 correlation_flag = d.get("correlation_flag", False)
                 cro_notes = d.get("cro_notes", cro_notes)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log("error", f"CRO JSON parse failed for {rec.rec_id}: {e} | raw: {parsed[:100]}")
+        else:
+            self._log("error", f"CRO could not extract JSON for {rec.rec_id} — using hard-limit result only")
 
         result = RiskCheckResult(
             rec_id=rec.rec_id,

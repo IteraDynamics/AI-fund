@@ -412,23 +412,31 @@ elif page == "Issue Directive":
                 f"the Activity Monitor page to continue."
             )
 
-        st.info("Check the **Activity Monitor** page to see what every agent did.")
+        st.info("Scroll down to see your CEO inbox — replies from the CIO and PMs will appear there.")
+        st.rerun()
 
     st.divider()
     st.markdown("#### CEO Inbox (messages addressed to you)")
+    st.caption("CIO acknowledgments, PM updates, and trade execution notifications appear here.")
     try:
         from hedge_fund.messaging.bus import receive
         ceo_msgs = receive("ceo", limit=20, mark_read=False)
         if ceo_msgs:
             for msg in ceo_msgs:
+                priority_color = {"high": "🔴", "urgent": "🚨", "normal": "🔵", "low": "⚪"}.get(
+                    msg.priority.value, "•"
+                )
                 with st.expander(
-                    f"[{msg.priority.value.upper()}] From: {msg.sender} — {msg.subject}",
-                    expanded=False,
+                    f"{priority_color} From: **{msg.sender}** — {msg.subject}",
+                    expanded=msg.priority.value in ("high", "urgent"),
                 ):
                     st.caption(f"Received: {msg.timestamp.strftime('%Y-%m-%d %H:%M UTC')}")
                     st.write(msg.body)
         else:
-            st.info("No messages for the CEO yet.")
+            st.info(
+                "No messages yet. Issue a directive above — the CIO will acknowledge it "
+                "and send updates as PMs complete their work."
+            )
     except Exception as e:
         st.warning(f"Could not load inbox: {e}")
 
